@@ -54,6 +54,7 @@ import os
 import math
 import time
 import traceback
+import sqlite3
 
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -77,6 +78,11 @@ TOKEN_FILE = os.path.join(
 OUTPUT_FILE = os.path.join(
     BASE_DIR,
     "Upstox_NIFTY_5Min_OptionChain.xlsx"
+)
+
+DB_FILE = os.path.join(
+    BASE_DIR,
+    "Upstox_NIFTY_OptionChain.db"
 )
 
 
@@ -221,6 +227,11 @@ print()
 print(
     "Output     :",
     OUTPUT_FILE
+)
+
+print(
+    "Database   :",
+    DB_FILE
 )
 
 print()
@@ -381,6 +392,211 @@ def api_get(
         )
 
         return None
+
+
+# ============================================================
+# ALL-STRIKE OPTION CHAIN
+# ============================================================
+# Upstox provides a dedicated option-chain endpoint containing
+# every strike for the requested expiry, with CE/PE market data
+# and Greeks.
+# ============================================================
+
+def get_option_chain(expiry_date):
+
+    url = API_V2 + "/option/chain"
+
+    data = api_get(
+        url,
+        params={
+            "instrument_key": UNDERLYING_KEY,
+            "expiry_date": expiry_date
+        }
+    )
+
+    if not data:
+        return []
+
+    try:
+        rows = data.get("data", [])
+        return rows if isinstance(rows, list) else []
+    except Exception:
+        return []
+
+
+def build_all_strike_chain(expiry_date):
+
+    raw_rows = get_option_chain(expiry_date)
+    records = []
+
+    for row in raw_rows:
+
+        try:
+            strike = safe_float(row.get("strike_price"))
+            spot = safe_float(row.get("underlying_spot_price"))
+            expiry = row.get("expiry", expiry_date)
+            pcr = safe_float(row.get("pcr"))
+
+            if not np.isfinite(strike):
+                continue
+
+            call = row.get("call_options") or {}
+            put = row.get("put_options") or {}
+
+            cm = call.get("market_data") or {}
+            pm = put.get("market_data") or {}
+            cg = call.get("option_greeks") or {}
+            pg = put.get("option_greeks") or {}
+
+            call_oi_raw = safe_float(cm.get("oi"))
+            put_oi_raw = safe_float(pm.get("oi"))
+            call_prev_oi_raw = safe_float(cm.get("prev_oi"))
+            put_prev_oi_raw = safe_float(pm.get("prev_oi"))
+
+            records.append({
+                "expiry": expiry,
+                "underlying_spot": spot,
+                "strike": strike,
+                "Moneyness": get_moneyness(strike, spot) if np.isfinite(spot) else "",
+
+                "CE_Instrument_Key": call.get("instrument_key"),
+                "CE_LTP": safe_float(cm.get("ltp")),
+                "CE_Close": safe_float(cm.get("close_price")),
+                "CE_Volume_RAW": safe_float(cm.get("volume")),
+                "CE_Volume": safe_float(cm.get("volume")) / LOT_SIZE,
+                "CE_OI_RAW": call_oi_raw,
+                "CE_OI": call_oi_raw / LOT_SIZE if np.isfinite(call_oi_raw) else np.nan,
+                "CE_Previous_OI_RAW": call_prev_oi_raw,
+                "CE_Previous_OI": call_prev_oi_raw / LOT_SIZE if np.isfinite(call_prev_oi_raw) else np.nan,
+                "CE_Change_OI": (call_oi_raw - call_prev_oi_raw) / LOT_SIZE if np.isfinite(call_oi_raw) and np.isfinite(call_prev_oi_raw) else np.nan,
+                "CE_Bid": safe_float(cm.get("bid_price")),
+                "CE_Bid_Qty": safe_float(cm.get("bid_qty")),
+                "CE_Ask": safe_float(cm.get("ask_price")),
+                "CE_Ask_Qty": safe_float(cm.get("ask_qty")),
+                "CE_IV": safe_float(cg.get("iv")),
+                "CE_Delta": safe_float(cg.get("delta")),
+                "CE_Gamma": safe_float(cg.get("gamma")),
+                "CE_Theta": safe_float(cg.get("theta")),
+                "CE_Vega": safe_float(cg.get("vega")),
+                "CE_POP": safe_float(cg.get("pop")),
+
+                "PCR_OI": pcr,
+
+                "PE_Instrument_Key": put.get("instrument_key"),
+                "PE_LTP": safe_float(pm.get("ltp")),
+                "PE_Close": safe_float(pm.get("close_price")),
+                "PE_Volume_RAW": safe_float(pm.get("volume")),
+                "PE_Volume": safe_float(pm.get("volume")) / LOT_SIZE,
+                "PE_OI_RAW": put_oi_raw,
+                "PE_OI": put_oi_raw / LOT_SIZE if np.isfinite(put_oi_raw) else np.nan,
+                "PE_Previous_OI_RAW": put_prev_oi_raw,
+                "PE_Previous_OI": put_prev_oi_raw / LOT_SIZE if np.isfinite(put_prev_oi_raw) else np.nan,
+                "PE_Change_OI": (put_oi_raw - put_prev_oi_raw) / LOT_SIZE if np.isfinite(put_oi_raw) and np.isfinite(put_prev_oi_raw) else np.nan,
+                "PE_Bid": safe_float(pm.get("bid_price")),
+                "PE_Bid_Qty": safe_float(pm.get("bid_qty")),
+                "PE_Ask": safe_float(pm.get("ask_price")),
+                "PE_Ask_Qty": safe_float(pm.get("ask_qty")),
+                "PE_IV": safe_float(pg.get("iv")),
+                "PE_Delta": safe_float(pg.get("delta")),
+                "PE_Gamma": safe_float(pg.get("gamma")),
+                "PE_Theta": safe_float(pg.get("theta")),
+                "PE_Vega": safe_float(pg.get("vega")),
+                "PE_POP": safe_float(pg.get("pop"))
+            })
+
+        except Exception:
+            continue
+
+    df = pd.DataFrame(records)
+
+    if not df.empty:
+        df = df.sort_values("strike").reset_index(drop=True)
+        df["Total_OI"] = df["CE_OI"].fillna(0) + df["PE_OI"].fillna(0)
+        df["OI_Difference"] = df["PE_OI"] - df["CE_OI"]
+        df["PCR_Change_OI"] = np.where(
+            df["CE_Change_OI"].notna() & (df["CE_Change_OI"].abs() > 0),
+            df["PE_Change_OI"] / df["CE_Change_OI"],
+            np.nan
+        )
+
+    return df
+
+
+# ============================================================
+# EXPIRY LIST
+# ============================================================
+
+def get_active_expiries():
+
+    data = api_get(
+        API_V2 + "/option/contract",
+        params={"instrument_key": UNDERLYING_KEY}
+    )
+
+    expiries = set()
+
+    if data:
+        for item in data.get("data", []):
+            expiry = item.get("expiry")
+            if expiry:
+                expiries.add(str(expiry))
+
+    return sorted(expiries)
+
+
+def get_past_expiries():
+
+    data = api_get(
+        API_V2 + "/expired-instruments/expiries",
+        params={"instrument_key": UNDERLYING_KEY}
+    )
+
+    if not data:
+        return []
+
+    values = data.get("data", [])
+    return sorted({str(x) for x in values if x})
+
+
+def build_expiry_dataframe():
+
+    today_date = datetime.now(IST).date()
+
+    active = get_active_expiries()
+    past = get_past_expiries()
+
+    rows = []
+    all_dates = sorted(set(active + past))
+
+    for expiry in all_dates:
+        try:
+            expiry_date = datetime.strptime(expiry, "%Y-%m-%d").date()
+        except Exception:
+            continue
+
+        if expiry_date < today_date:
+            status = "PAST"
+            source = "Upstox expired-instruments"
+        elif expiry_date == today_date:
+            status = "TODAY"
+            source = "Upstox active contracts"
+        else:
+            status = "COMING"
+            source = "Upstox active contracts"
+
+        rows.append({
+            "Expiry": expiry,
+            "Status": status,
+            "Source": source
+        })
+
+    df = pd.DataFrame(rows)
+
+    if not df.empty:
+        df["Expiry"] = pd.to_datetime(df["Expiry"]).dt.date.astype(str)
+        df = df.sort_values("Expiry").reset_index(drop=True)
+
+    return df, active, past
 
 
 # ============================================================
@@ -2029,6 +2245,9 @@ while current_date <= effective_end_date:
                 "trade_date":
                     current_date,
 
+                "expiry":
+                    EXPIRY_DATE,
+
                 "strike":
                     float(strike),
 
@@ -2110,12 +2329,60 @@ else:
 
         columns=[
             "trade_date",
+            "expiry",
             "strike",
             "CE_OI_RAW",
             "PE_OI_RAW"
         ]
 
     )
+
+
+# ============================================================
+# DROP STALE / DUPLICATE OI SNAPSHOT DATES
+#
+# The historical OI endpoint is often called for every calendar
+# date in range, including weekends and holidays. On a
+# non-trading date it frequently just echoes back the OI
+# snapshot of the last real trading day instead of returning
+# nothing. If that duplicate date is left in place it can get
+# picked as the "latest" or "previous" date in the sync step,
+# which makes CE_Change_OI / PE_Change_OI come out as 0 and can
+# also make the reported Date look wrong (e.g. a weekend date).
+#
+# Fix: for each date (in order), compare the FULL set of raw OI
+# values across all strikes to the immediately preceding date.
+# If it is byte-for-byte identical, treat it as a stale repeat
+# of the same trading session and drop it.
+# ============================================================
+
+if not oi_df.empty:
+
+    _sig_df = oi_df.sort_values(
+        ["trade_date", "strike"]
+    )
+
+    _signatures = _sig_df.groupby("trade_date").apply(
+        lambda g: tuple(g["CE_OI_RAW"].fillna(-1)) + tuple(g["PE_OI_RAW"].fillna(-1))
+    ).sort_index()
+
+    _is_stale_repeat = _signatures == _signatures.shift(1)
+
+    _stale_dates = set(
+        _signatures.index[_is_stale_repeat.fillna(False)]
+    )
+
+    if _stale_dates:
+
+        print()
+        print(
+            "Skipping stale/non-trading OI snapshot dates (identical to previous session):",
+            sorted(str(d) for d in _stale_dates)
+        )
+
+        oi_df = oi_df[
+            ~oi_df["trade_date"].isin(_stale_dates)
+        ].reset_index(drop=True)
 
 
 # ============================================================
@@ -3502,6 +3769,8 @@ summary = pd.DataFrame({
 
         "Expiry",
 
+        "Historical OI Expiry Column",
+
         "Requested Start",
 
         "Requested End",
@@ -3544,6 +3813,8 @@ summary = pd.DataFrame({
         UNDERLYING_KEY,
 
         EXPIRY_DATE,
+
+        "expiry",
 
         START_DATE,
 
@@ -3605,6 +3876,536 @@ summary = pd.DataFrame({
 
 
 # ============================================================
+# COLUMN ORDER FOR OptionChain_AllStrikes
+#
+# Puts Date / identity / OI columns on the LEFT where they are
+# easy to see, instead of buried at the far right of a wide
+# sheet. Everything else keeps its original relative order.
+# ============================================================
+
+ALL_STRIKE_FRONT_COLUMNS = [
+    "Date",
+    "expiry",
+    "underlying_spot",
+    "strike",
+    "Moneyness",
+
+    "CE_OI_RAW",
+    "CE_OI",
+    "CE_Previous_OI",
+    "CE_Change_OI",
+
+    "PE_OI_RAW",
+    "PE_OI",
+    "PE_Previous_OI",
+    "PE_Change_OI",
+
+    "Total_OI",
+    "OI_Difference",
+    "PCR_OI",
+    "PCR_Change_OI"
+]
+
+
+def reorder_all_strike_columns(df):
+
+    front_cols = [
+        c for c in ALL_STRIKE_FRONT_COLUMNS
+        if c in df.columns
+    ]
+
+    remaining_cols = [
+        c for c in df.columns
+        if c not in front_cols
+    ]
+
+    return df[front_cols + remaining_cols]
+
+
+# ============================================================
+# FORCE ALL-STRIKE OI TO USE THE SAME HISTORICAL OI TABLE
+# AS OPTIONCHAIN_5MIN
+# ============================================================
+
+def sync_all_strike_oi_with_historical(all_strike_df, historical_oi_df):
+
+    # ------------------------------------------------------------
+    # FALLBACK DATE
+    #
+    # Used whenever historical OI is unavailable, so the Date
+    # column on OptionChain_AllStrikes is NEVER blank.
+    # ------------------------------------------------------------
+
+    fallback_date_string = datetime.now(IST).date().strftime("%Y-%m-%d")
+
+    if all_strike_df is None or all_strike_df.empty:
+        return all_strike_df
+
+    if historical_oi_df is None or historical_oi_df.empty:
+
+        all_strike_df = all_strike_df.copy()
+        all_strike_df["Date"] = fallback_date_string
+        all_strike_df["OI_Reference_Date"] = fallback_date_string
+        all_strike_df["OI_Previous_Trade_Date"] = ""
+
+        all_strike_df = reorder_all_strike_columns(all_strike_df)
+
+        print()
+        print("ALL-STRIKE OI SYNC SKIPPED")
+        print("Reason: Historical_OI data not available.")
+        print("Date column filled with today's date as fallback:", fallback_date_string)
+
+        return all_strike_df
+
+    hist = historical_oi_df.copy()
+
+    # ------------------------------------------------------------
+    # NORMALIZE DATE AND STRIKE
+    # ------------------------------------------------------------
+    hist["trade_date"] = pd.to_datetime(
+        hist["trade_date"],
+        errors="coerce"
+    ).dt.date
+
+    hist["strike"] = pd.to_numeric(
+        hist["strike"],
+        errors="coerce"
+    ).round(2)
+
+    hist = hist.dropna(
+        subset=["trade_date", "strike"]
+    ).copy()
+
+    if hist.empty:
+
+        all_strike_df = all_strike_df.copy()
+        all_strike_df["Date"] = fallback_date_string
+        all_strike_df["OI_Reference_Date"] = fallback_date_string
+        all_strike_df["OI_Previous_Trade_Date"] = ""
+
+        all_strike_df = reorder_all_strike_columns(all_strike_df)
+
+        print()
+        print("ALL-STRIKE OI SYNC SKIPPED")
+        print("Reason: Historical_OI has no valid trade_date/strike rows.")
+        print("Date column filled with today's date as fallback:", fallback_date_string)
+
+        return all_strike_df
+
+    # ------------------------------------------------------------
+    # KEEP ONE ROW PER DATE + STRIKE
+    # ------------------------------------------------------------
+    hist = hist.sort_values(
+        ["trade_date", "strike"]
+    ).drop_duplicates(
+        subset=["trade_date", "strike"],
+        keep="last"
+    ).reset_index(drop=True)
+
+    # ------------------------------------------------------------
+    # IMPORTANT
+    #
+    # The latest date is the date shown in OptionChain_AllStrikes.
+    # The previous date is the previous available OI date.
+    #
+    # CHANGE OI IS ALWAYS CALCULATED FROM RAW OI:
+    #
+    # CE_Change_OI = (Current CE_OI_RAW
+    #                 - Previous CE_OI_RAW) / 65
+    #
+    # PE_Change_OI = (Current PE_OI_RAW
+    #                 - Previous PE_OI_RAW) / 65
+    # ------------------------------------------------------------
+
+    all_dates = sorted(
+        hist["trade_date"].dropna().unique()
+    )
+
+    latest_date = all_dates[-1]
+
+    previous_date = (
+        all_dates[-2]
+        if len(all_dates) >= 2
+        else None
+    )
+
+    current = hist[
+        hist["trade_date"] == latest_date
+    ].copy()
+
+    previous = pd.DataFrame()
+
+    if previous_date is not None:
+        previous = hist[
+            hist["trade_date"] == previous_date
+        ].copy()
+
+    # ------------------------------------------------------------
+    # CURRENT OI
+    # ------------------------------------------------------------
+
+    current = current[[
+        c for c in [
+            "strike",
+            "CE_OI_RAW",
+            "PE_OI_RAW"
+        ]
+        if c in current.columns
+    ]].rename(columns={
+        "CE_OI_RAW": "SYNC_CE_OI_RAW",
+        "PE_OI_RAW": "SYNC_PE_OI_RAW"
+    })
+
+    # ------------------------------------------------------------
+    # PREVIOUS OI
+    # ------------------------------------------------------------
+
+    if not previous.empty:
+
+        previous = previous[[
+            c for c in [
+                "strike",
+                "CE_OI_RAW",
+                "PE_OI_RAW"
+            ]
+            if c in previous.columns
+        ]].rename(columns={
+            "CE_OI_RAW": "SYNC_CE_PREVIOUS_OI_RAW",
+            "PE_OI_RAW": "SYNC_PE_PREVIOUS_OI_RAW"
+        })
+
+    else:
+
+        previous = pd.DataFrame(columns=[
+            "strike",
+            "SYNC_CE_PREVIOUS_OI_RAW",
+            "SYNC_PE_PREVIOUS_OI_RAW"
+        ])
+
+    # ------------------------------------------------------------
+    # PREPARE ALL-STRIKE DATA
+    # ------------------------------------------------------------
+
+    result = all_strike_df.copy()
+
+    result["strike"] = pd.to_numeric(
+        result["strike"],
+        errors="coerce"
+    ).round(2)
+
+    # NOTE: both "strike" columns are rounded to 2 decimals above.
+    # Without this, tiny floating-point differences between the
+    # live option-chain strike (e.g. 24200.000000001) and the
+    # historical OI strike (e.g. 24200.0) silently fail the merge
+    # below, leaving CE_OI / PE_OI blank for that strike -- this
+    # was the main cause of OI "not matching" between
+    # OptionChain_AllStrikes and Historical_OI.
+
+    # Remove old OI columns before merging so there is NO _x / _y
+    # collision and no accidental use of old option-chain OI.
+
+    old_oi_columns = [
+        "CE_OI_RAW",
+        "CE_OI",
+        "CE_Previous_OI_RAW",
+        "CE_Previous_OI",
+        "CE_Change_OI",
+        "PE_OI_RAW",
+        "PE_OI",
+        "PE_Previous_OI_RAW",
+        "PE_Previous_OI",
+        "PE_Change_OI"
+    ]
+
+    result = result.drop(
+        columns=[
+            c for c in old_oi_columns
+            if c in result.columns
+        ],
+        errors="ignore"
+    )
+
+    result = result.merge(
+        current,
+        on="strike",
+        how="left"
+    )
+
+    result = result.merge(
+        previous,
+        on="strike",
+        how="left"
+    )
+
+    # ------------------------------------------------------------
+    # RAW OI (restored)
+    #
+    # These were previously dropped by old_oi_columns and never
+    # put back, so OptionChain_AllStrikes had no raw OI figures
+    # to compare against Historical_OI. Restoring them here keeps
+    # both sheets showing the exact same raw numbers.
+    # ------------------------------------------------------------
+
+    result["CE_OI_RAW"] = result["SYNC_CE_OI_RAW"]
+    result["PE_OI_RAW"] = result["SYNC_PE_OI_RAW"]
+
+    # ------------------------------------------------------------
+    # CURRENT OI / 65
+    # ------------------------------------------------------------
+
+    result["CE_OI"] = (
+        result["SYNC_CE_OI_RAW"]
+        / LOT_SIZE
+    )
+
+    result["PE_OI"] = (
+        result["SYNC_PE_OI_RAW"]
+        / LOT_SIZE
+    )
+
+    # ------------------------------------------------------------
+    # PREVIOUS OI / 65
+    # ------------------------------------------------------------
+
+    result["CE_Previous_OI"] = (
+        result["SYNC_CE_PREVIOUS_OI_RAW"]
+        / LOT_SIZE
+    )
+
+    result["PE_Previous_OI"] = (
+        result["SYNC_PE_PREVIOUS_OI_RAW"]
+        / LOT_SIZE
+    )
+
+    # ------------------------------------------------------------
+    # CHANGE OI
+    #
+    # DO NOT use 5-minute diff here.
+    # DO NOT copy the option-chain change-OI.
+    #
+    # Calculate directly from the Historical_OI daily values.
+    # ------------------------------------------------------------
+
+    result["CE_Change_OI"] = (
+        result["CE_OI"]
+        - result["CE_Previous_OI"]
+    )
+
+    result["PE_Change_OI"] = (
+        result["PE_OI"]
+        - result["PE_Previous_OI"]
+    )
+
+    # ------------------------------------------------------------
+    # REFERENCE DATE
+    # ------------------------------------------------------------
+
+    result["trade_date"] = latest_date
+
+    # Plain, always-visible "Date" column = the OI reference date
+    # (the date whose OI values are shown on this sheet). Same
+    # value as OI_Reference_Date, kept as a separate simple column
+    # so it's easy to spot without hunting through the sheet.
+    result["Date"] = latest_date.strftime("%Y-%m-%d")
+
+    result["OI_Reference_Date"] = latest_date.strftime(
+        "%Y-%m-%d"
+    )
+
+    result["OI_Previous_Trade_Date"] = (
+        previous_date.strftime("%Y-%m-%d")
+        if previous_date is not None
+        else ""
+    )
+
+    # ------------------------------------------------------------
+    # OI-DERIVED VALUES
+    # ------------------------------------------------------------
+
+    result["PCR_OI"] = np.where(
+        result["CE_OI"].notna()
+        & (result["CE_OI"].abs() > 0),
+        result["PE_OI"] / result["CE_OI"],
+        np.nan
+    )
+
+    result["PCR_Change_OI"] = np.where(
+        result["CE_Change_OI"].notna()
+        & (result["CE_Change_OI"].abs() > 0),
+        result["PE_Change_OI"]
+        / result["CE_Change_OI"],
+        np.nan
+    )
+
+    result["Total_OI"] = (
+        result["CE_OI"].fillna(0)
+        + result["PE_OI"].fillna(0)
+    )
+
+    result["OI_Difference"] = (
+        result["PE_OI"]
+        - result["CE_OI"]
+    )
+
+    # ------------------------------------------------------------
+    # CLEAN TEMPORARY COLUMNS
+    # ------------------------------------------------------------
+
+    result = result.drop(
+        columns=[
+            "SYNC_CE_OI_RAW",
+            "SYNC_PE_OI_RAW",
+            "SYNC_CE_PREVIOUS_OI_RAW",
+            "SYNC_PE_PREVIOUS_OI_RAW"
+        ],
+        errors="ignore"
+    )
+
+    # ------------------------------------------------------------
+    # REORDER COLUMNS
+    #
+    # Put Date / strike / OI / Change OI columns on the left,
+    # instead of at the far right of a very wide sheet.
+    # ------------------------------------------------------------
+
+    result = reorder_all_strike_columns(result)
+
+    print()
+    print("ALL-STRIKE OI SYNC COMPLETE")
+    print("OI reference date:", latest_date)
+    print("Previous OI date :", previous_date)
+    print("OI formula       : CURRENT RAW / 65")
+    print("CHANGE formula   : (CURRENT RAW - PREVIOUS RAW) / 65")
+
+    # ------------------------------------------------------------
+    # DEBUG CHECK FOR 24200
+    # ------------------------------------------------------------
+
+    check_24200 = result[
+        result["strike"] == 24200
+    ]
+
+    if not check_24200.empty:
+        r = check_24200.iloc[0]
+        print()
+        print("24200 CE OI CHECK")
+        print("Current CE OI     :", r.get("CE_OI"))
+        print("Previous CE OI    :", r.get("CE_Previous_OI"))
+        print("CE Change OI      :", r.get("CE_Change_OI"))
+        print("Current trade date:", r.get("trade_date"))
+
+    return result
+
+
+# ============================================================
+# ALL-STRIKE OPTION CHAIN + SINGLE EXPIRY LIST
+# ============================================================
+
+print()
+print("=" * 80)
+print("DOWNLOADING ALL-STRIKE OPTION CHAIN")
+print("=" * 80)
+print()
+
+all_strike_chain = build_all_strike_chain(EXPIRY_DATE)
+
+all_strike_chain = sync_all_strike_oi_with_historical(
+    all_strike_chain,
+    oi_df
+)
+
+print(
+    "All-strike rows:",
+    len(all_strike_chain)
+)
+
+print()
+print("=" * 80)
+print("DOWNLOADING EXPIRY LIST")
+print("=" * 80)
+print()
+
+expiry_df, active_expiries, past_expiries = build_expiry_dataframe()
+
+print(
+    "Expiry list rows:",
+    len(expiry_df)
+)
+
+
+
+# ============================================================
+# SQLITE DATABASE
+# ============================================================
+
+print()
+print("=" * 80)
+print("SAVING DATA TO SQLITE DATABASE")
+print("=" * 80)
+print()
+
+try:
+    db = sqlite3.connect(DB_FILE)
+
+    chain.to_sql(
+        "optionchain_5min",
+        db,
+        if_exists="replace",
+        index=False
+    )
+
+    spot_excel.to_sql(
+        "nifty_spot_5min",
+        db,
+        if_exists="replace",
+        index=False
+    )
+
+    contracts_excel.to_sql(
+        "contracts_selected",
+        db,
+        if_exists="replace",
+        index=False
+    )
+
+    oi_excel.to_sql(
+        "historical_oi",
+        db,
+        if_exists="replace",
+        index=False
+    )
+
+    all_strike_chain.to_sql(
+        "optionchain_all_strikes",
+        db,
+        if_exists="replace",
+        index=False
+    )
+
+    expiry_df.to_sql(
+        "expiry_list",
+        db,
+        if_exists="replace",
+        index=False
+    )
+
+    # Remove old separate expiry tables from previous script versions.
+    db.execute("DROP TABLE IF EXISTS coming_expiries")
+    db.execute("DROP TABLE IF EXISTS past_expiries")
+
+    db.commit()
+    db.close()
+
+    print("Database saved:")
+    print(DB_FILE)
+
+except Exception as error:
+    print()
+    print("DATABASE ERROR")
+    print(error)
+
+
+# ============================================================
 # WRITE EXCEL
 # ============================================================
 
@@ -3663,6 +4464,28 @@ try:
             writer,
 
             sheet_name="Historical_OI",
+
+            index=False
+
+        )
+
+
+        all_strike_chain.to_excel(
+
+            writer,
+
+            sheet_name="OptionChain_AllStrikes",
+
+            index=False
+
+        )
+
+
+        expiry_df.to_excel(
+
+            writer,
+
+            sheet_name="Expiry_List",
 
             index=False
 
@@ -4045,6 +4868,79 @@ try:
                 )
 
 
+    # ========================================================
+    # ALL-STRIKE / EXPIRY SHEETS
+    # ========================================================
+
+    for sheet_name in [
+        "OptionChain_AllStrikes",
+        "Expiry_List"
+    ]:
+
+        if sheet_name not in wb.sheetnames:
+            continue
+
+        ws_extra = wb[sheet_name]
+        extra_header = {
+            cell.value: cell.column
+            for cell in ws_extra[1]
+        }
+
+        for name in [
+            "strike",
+            "underlying_spot",
+            "CE_LTP",
+            "CE_Close",
+            "PE_LTP",
+            "PE_Close",
+            "CE_IV",
+            "PE_IV",
+            "CE_Delta",
+            "PE_Delta",
+            "CE_Gamma",
+            "PE_Gamma",
+            "CE_Theta",
+            "PE_Theta",
+            "CE_Vega",
+            "PE_Vega",
+            "PCR_OI",
+            "PCR_Change_OI"
+        ]:
+            if name not in extra_header:
+                continue
+            col = get_column_letter(extra_header[name])
+            for cell in ws_extra[col][1:]:
+                cell.number_format = "0.0000"
+
+        for name in [
+            "CE_Volume_RAW",
+            "CE_Volume",
+            "CE_OI_RAW",
+            "CE_OI",
+            "CE_Previous_OI_RAW",
+            "CE_Previous_OI",
+            "CE_Change_OI",
+            "CE_Bid_Qty",
+            "CE_Ask_Qty",
+            "PE_Volume_RAW",
+            "PE_Volume",
+            "PE_OI_RAW",
+            "PE_OI",
+            "PE_Previous_OI_RAW",
+            "PE_Previous_OI",
+            "PE_Change_OI",
+            "PE_Bid_Qty",
+            "PE_Ask_Qty",
+            "Total_OI",
+            "OI_Difference"
+        ]:
+            if name not in extra_header:
+                continue
+            col = get_column_letter(extra_header[name])
+            for cell in ws_extra[col][1:]:
+                cell.number_format = "#,##0"
+
+
     wb.save(
         OUTPUT_FILE
     )
@@ -4210,6 +5106,10 @@ print(
 )
 
 print()
+print("Database:")
+print(DB_FILE)
+
+print()
 
 print(
     "Final rows:",
@@ -4244,7 +5144,15 @@ print(
 )
 
 print(
-    "5. Summary"
+    "5. OptionChain_AllStrikes"
+)
+
+print(
+    "6. Expiry_List"
+)
+
+print(
+    "7. Summary"
 )
 
 print()
