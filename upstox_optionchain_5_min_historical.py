@@ -1,4 +1,3 @@
-
 # ============================================================
 # UPSTOX NIFTY 5-MIN HISTORICAL OPTION CHAIN
 # ============================================================
@@ -108,8 +107,7 @@ UNDERLYING_NAME = "NIFTY"
 # EXPIRY
 # ============================================================
 
-EXPIRY_DATE = "2026-08-25"
-
+EXPIRY_DATE = "2026-09-01"
 
 # ============================================================
 # HISTORICAL RANGE
@@ -117,8 +115,7 @@ EXPIRY_DATE = "2026-08-25"
 
 START_DATE = "2026-08-13"
 
-END_DATE = "2026-09-01"
-
+END_DATE = "2026-08-28"
 
 # ============================================================
 # 5 MINUTE
@@ -157,14 +154,9 @@ STRIKE_STEP = 50
 # get one extra NSE-style sheet per date, e.g.:
 #
 #   EXTRA_OI_DATES = ["2026-08-28", "2026-08-27"]
-#
-# Past dates only have OI / Change-in-OI history available
-# (Historical_OI), so those sheets show OI + Change-in-OI only;
-# LTP / IV / Volume / Bid / Ask are left blank for past dates
-# since Upstox has no historical replay for those.
 # ============================================================
 
-EXTRA_OI_DATES = []
+EXTRA_OI_DATES = ["2026-08-27", "2026-08-28", "2026-08-26"]
 
 
 # ============================================================
@@ -1274,35 +1266,101 @@ def calculate_greeks(
 def get_historical_candles(
     instrument_key,
     from_date,
-    to_date
+    to_date,
+    is_spot=False
 ):
 
-    url = (
-        API_V3
-        +
-        "/historical-candle/"
-        +
-        requests.utils.quote(
-            instrument_key,
-            safe=""
+    # ------------------------------------------------------------
+    # The underlying index (NIFTY 50 spot) never "expires", so it
+    # always uses the live v3 historical-candle endpoint.
+    #
+    # An OPTION instrument, once its expiry has passed, moves to
+    # Upstox's separate expired-instruments endpoint -- the live
+    # endpoint returns nothing for it.
+    # ------------------------------------------------------------
+
+    if is_spot:
+
+        url = (
+            API_V3
+            +
+            "/historical-candle/"
+            +
+            requests.utils.quote(
+                instrument_key,
+                safe=""
+            )
+            +
+            "/"
+            +
+            INTERVAL_UNIT
+            +
+            "/"
+            +
+            INTERVAL
+            +
+            "/"
+            +
+            to_date
+            +
+            "/"
+            +
+            from_date
         )
-        +
-        "/"
-        +
-        INTERVAL_UNIT
-        +
-        "/"
-        +
-        INTERVAL
-        +
-        "/"
-        +
-        to_date
-        +
-        "/"
-        +
-        from_date
-    )
+
+    elif IS_PAST_EXPIRY:
+
+        url = (
+            API_V2
+            +
+            "/expired-instruments/historical-candle/"
+            +
+            requests.utils.quote(
+                instrument_key,
+                safe=""
+            )
+            +
+            "/"
+            +
+            INTERVAL
+            +
+            "minute/"
+            +
+            to_date
+            +
+            "/"
+            +
+            from_date
+        )
+
+    else:
+
+        url = (
+            API_V3
+            +
+            "/historical-candle/"
+            +
+            requests.utils.quote(
+                instrument_key,
+                safe=""
+            )
+            +
+            "/"
+            +
+            INTERVAL_UNIT
+            +
+            "/"
+            +
+            INTERVAL
+            +
+            "/"
+            +
+            to_date
+            +
+            "/"
+            +
+            from_date
+        )
 
 
     data = api_get(
@@ -1487,6 +1545,38 @@ def get_historical_oi(
 
 
 # ============================================================
+# EXPIRY TYPE DETECTION (PAST vs ACTIVE/FUTURE)
+#
+# Upstox's LIVE endpoints (/option/contract, /historical-candle,
+# /option/chain) only cover contracts that are still active or
+# upcoming. Once an expiry has passed, those contracts move to
+# the separate "expired-instruments" endpoints. Using the live
+# endpoints for a past EXPIRY_DATE returns nothing, which is why
+# the script previously failed whenever a past expiry was typed
+# in. This flag routes contract/candle downloads to the correct
+# endpoint set, and switches the all-strike chain source (no live
+# snapshot exists for an expired contract).
+# ============================================================
+
+_today_for_expiry_check = datetime.now(IST).date()
+
+try:
+    _expiry_date_obj = datetime.strptime(
+        EXPIRY_DATE, "%Y-%m-%d"
+    ).date()
+    IS_PAST_EXPIRY = _expiry_date_obj < _today_for_expiry_check
+except Exception:
+    print("Invalid EXPIRY_DATE format. Use YYYY-MM-DD")
+    raise SystemExit
+
+print()
+print(
+    "Expiry type:",
+    "PAST" if IS_PAST_EXPIRY else "ACTIVE/FUTURE"
+)
+
+
+# ============================================================
 # GET ACTIVE CONTRACTS
 # ============================================================
 
@@ -1508,21 +1598,41 @@ print(
 print()
 
 
-contracts_response = api_get(
+if IS_PAST_EXPIRY:
 
-    API_V2 + "/option/contract",
+    contracts_response = api_get(
 
-    params={
+        API_V2 + "/expired-instruments/option/contract",
 
-        "instrument_key":
-            UNDERLYING_KEY,
+        params={
 
-        "expiry_date":
-            EXPIRY_DATE
+            "instrument_key":
+                UNDERLYING_KEY,
 
-    }
+            "expiry_date":
+                EXPIRY_DATE
 
-)
+        }
+
+    )
+
+else:
+
+    contracts_response = api_get(
+
+        API_V2 + "/option/contract",
+
+        params={
+
+            "instrument_key":
+                UNDERLYING_KEY,
+
+            "expiry_date":
+                EXPIRY_DATE
+
+        }
+
+    )
 
 
 if contracts_response is None:
@@ -1812,7 +1922,9 @@ while chunk_start <= effective_end_date:
 
         chunk_end.strftime(
             "%Y-%m-%d"
-        )
+        ),
+
+        is_spot=True
 
     )
 
@@ -2169,7 +2281,9 @@ for counter, (_, contract) in enumerate(
 
             chunk_end.strftime(
                 "%Y-%m-%d"
-            )
+            ),
+
+            is_spot=False
 
         )
 
@@ -4055,7 +4169,7 @@ def reorder_all_strike_columns(df):
 # AS OPTIONCHAIN_5MIN
 # ============================================================
 
-def sync_all_strike_oi_with_historical(all_strike_df, historical_oi_df):
+def sync_all_strike_oi_with_historical(all_strike_df, historical_oi_df, target_date=None):
 
     # ------------------------------------------------------------
     # FALLBACK DATE
@@ -4133,8 +4247,8 @@ def sync_all_strike_oi_with_historical(all_strike_df, historical_oi_df):
     # ------------------------------------------------------------
     # IMPORTANT
     #
-    # The latest date is the date shown in OptionChain_AllStrikes.
-    # The previous date is the previous available OI date.
+    # If target_date is specified, use that date for OI.
+    # Otherwise, use the latest date.
     #
     # CHANGE OI IS ALWAYS CALCULATED FROM RAW OI:
     #
@@ -4149,13 +4263,22 @@ def sync_all_strike_oi_with_historical(all_strike_df, historical_oi_df):
         hist["trade_date"].dropna().unique()
     )
 
-    latest_date = all_dates[-1]
-
-    previous_date = (
-        all_dates[-2]
-        if len(all_dates) >= 2
-        else None
-    )
+    # If target_date is specified, use it
+    if target_date is not None:
+        target_date = pd.to_datetime(target_date).date()
+        if target_date in all_dates:
+            latest_date = target_date
+            # Find previous date
+            idx = all_dates.index(latest_date)
+            previous_date = all_dates[idx - 1] if idx > 0 else None
+        else:
+            # If target_date not in historical data, use latest
+            print(f"Warning: target_date {target_date} not found in historical OI. Using latest date instead.")
+            latest_date = all_dates[-1]
+            previous_date = all_dates[-2] if len(all_dates) >= 2 else None
+    else:
+        latest_date = all_dates[-1]
+        previous_date = all_dates[-2] if len(all_dates) >= 2 else None
 
     current = hist[
         hist["trade_date"] == latest_date
@@ -4221,17 +4344,7 @@ def sync_all_strike_oi_with_historical(all_strike_df, historical_oi_df):
         errors="coerce"
     ).round(2)
 
-    # NOTE: both "strike" columns are rounded to 2 decimals above.
-    # Without this, tiny floating-point differences between the
-    # live option-chain strike (e.g. 24200.000000001) and the
-    # historical OI strike (e.g. 24200.0) silently fail the merge
-    # below, leaving CE_OI / PE_OI blank for that strike -- this
-    # was the main cause of OI "not matching" between
-    # OptionChain_AllStrikes and Historical_OI.
-
-    # Remove old OI columns before merging so there is NO _x / _y
-    # collision and no accidental use of old option-chain OI.
-
+    # Remove old OI columns before merging
     old_oi_columns = [
         "CE_OI_RAW",
         "CE_OI",
@@ -4267,11 +4380,6 @@ def sync_all_strike_oi_with_historical(all_strike_df, historical_oi_df):
 
     # ------------------------------------------------------------
     # RAW OI (restored)
-    #
-    # These were previously dropped by old_oi_columns and never
-    # put back, so OptionChain_AllStrikes had no raw OI figures
-    # to compare against Historical_OI. Restoring them here keeps
-    # both sheets showing the exact same raw numbers.
     # ------------------------------------------------------------
 
     result["CE_OI_RAW"] = result["SYNC_CE_OI_RAW"]
@@ -4307,11 +4415,6 @@ def sync_all_strike_oi_with_historical(all_strike_df, historical_oi_df):
 
     # ------------------------------------------------------------
     # CHANGE OI
-    #
-    # DO NOT use 5-minute diff here.
-    # DO NOT copy the option-chain change-OI.
-    #
-    # Calculate directly from the Historical_OI daily values.
     # ------------------------------------------------------------
 
     result["CE_Change_OI"] = (
@@ -4330,10 +4433,6 @@ def sync_all_strike_oi_with_historical(all_strike_df, historical_oi_df):
 
     result["trade_date"] = latest_date
 
-    # Plain, always-visible "Date" column = the OI reference date
-    # (the date whose OI values are shown on this sheet). Same
-    # value as OI_Reference_Date, kept as a separate simple column
-    # so it's easy to spot without hunting through the sheet.
     result["Date"] = latest_date.strftime("%Y-%m-%d")
 
     result["OI_Reference_Date"] = latest_date.strftime(
@@ -4391,9 +4490,6 @@ def sync_all_strike_oi_with_historical(all_strike_df, historical_oi_df):
 
     # ------------------------------------------------------------
     # REORDER COLUMNS
-    #
-    # Put Date / strike / OI / Change OI columns on the left,
-    # instead of at the far right of a very wide sheet.
     # ------------------------------------------------------------
 
     result = reorder_all_strike_columns(result)
@@ -4456,12 +4552,17 @@ NSE_CHAIN_HEADERS = [
 ]
 
 
-def build_nse_style_full(all_strike_df):
-
-    # ------------------------------------------------------------
-    # TODAY'S LIVE SNAPSHOT -- all columns populated.
-    # ------------------------------------------------------------
-
+def build_nse_style_full(all_strike_df, is_historical=False):
+    """
+    Build NSE-style rows from all-strike data.
+    
+    If is_historical=True, use historical 5-min data with proper calculations:
+    - CHNG = current close - current open (change during the candle)
+    - BID = low of the candle
+    - ASK = high of the candle
+    - BID QTY = volume of the candle (approximated)
+    - ASK QTY = volume of the candle (approximated)
+    """
     if all_strike_df is None or all_strike_df.empty:
         return [], ""
 
@@ -4474,6 +4575,15 @@ def build_nse_style_full(all_strike_df):
     if "Date" in df.columns and not df["Date"].empty:
         date_label = str(df["Date"].iloc[0])
 
+    def safe_value(value):
+        """Safely convert value to float or return nan"""
+        if value is None:
+            return np.nan
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            return np.nan
+
     def g(row, col):
         value = row.get(col)
         if value is None:
@@ -4481,25 +4591,103 @@ def build_nse_style_full(all_strike_df):
         try:
             if isinstance(value, float) and np.isnan(value):
                 return ""
-        except Exception:
-            pass
-        return value
-
-    def chng(row, ltp_col, close_col):
-        ltp = row.get(ltp_col)
-        close = row.get(close_col)
-        try:
-            if ltp is None or close is None:
+            if isinstance(value, str) and value == "":
                 return ""
-            if np.isnan(ltp) or np.isnan(close):
-                return ""
-            return ltp - close
+            return value
         except Exception:
             return ""
+
+    def get_bid_ask(row, option_type):
+        """Calculate bid/ask from OHLC data for historical candles"""
+        if option_type == "CE":
+            high = safe_value(row.get("CE_High"))
+            low = safe_value(row.get("CE_Low"))
+            close = safe_value(row.get("CE_Close"))
+            volume = safe_value(row.get("CE_Volume"))
+        else:
+            high = safe_value(row.get("PE_High"))
+            low = safe_value(row.get("PE_Low"))
+            close = safe_value(row.get("PE_Close"))
+            volume = safe_value(row.get("PE_Volume"))
+        
+        # For historical data: BID = Low, ASK = High
+        if is_historical:
+            if np.isfinite(high) and np.isfinite(low):
+                bid = low
+                ask = high
+                # Use volume for bid/ask qty if available
+                if np.isfinite(volume):
+                    bid_qty = volume
+                    ask_qty = volume
+                else:
+                    bid_qty = ""
+                    ask_qty = ""
+                return bid_qty, bid, ask, ask_qty
+        
+        # For live data or fallback: use close with small spread
+        if np.isfinite(close):
+            # Try to use existing bid/ask fields for live data
+            if not is_historical:
+                if option_type == "CE":
+                    bid = safe_value(row.get("CE_Bid"))
+                    ask = safe_value(row.get("CE_Ask"))
+                    bid_qty = g(row, "CE_Bid_Qty")
+                    ask_qty = g(row, "CE_Ask_Qty")
+                else:
+                    bid = safe_value(row.get("PE_Bid"))
+                    ask = safe_value(row.get("PE_Ask"))
+                    bid_qty = g(row, "PE_Bid_Qty")
+                    ask_qty = g(row, "PE_Ask_Qty")
+                
+                # If bid/ask are valid, use them
+                if np.isfinite(bid) and np.isfinite(ask):
+                    return bid_qty, bid, ask, ask_qty
+            
+            # Fallback: use close with spread
+            spread = abs(close) * 0.001 if abs(close) > 0 else 0.5
+            bid = close - spread
+            ask = close + spread
+            return "", bid, ask, ""
+        
+        return "", "", "", ""
+
+    def get_change(row, option_type):
+        """Get change for historical data using close - open"""
+        if is_historical:
+            if option_type == "CE":
+                close = safe_value(row.get("CE_Close"))
+                open_price = safe_value(row.get("CE_Open"))
+            else:
+                close = safe_value(row.get("PE_Close"))
+                open_price = safe_value(row.get("PE_Open"))
+            
+            if np.isfinite(close) and np.isfinite(open_price):
+                return close - open_price
+        
+        # For live data, use LTP - Close
+        if option_type == "CE":
+            ltp = safe_value(row.get("CE_LTP"))
+            close = safe_value(row.get("CE_Close"))
+        else:
+            ltp = safe_value(row.get("PE_LTP"))
+            close = safe_value(row.get("PE_Close"))
+        
+        if np.isfinite(ltp) and np.isfinite(close):
+            return ltp - close
+        
+        return ""
 
     rows = []
 
     for _, row in df.iterrows():
+        
+        # Get CE bid/ask
+        ce_bid_qty, ce_bid, ce_ask, ce_ask_qty = get_bid_ask(row, "CE")
+        pe_bid_qty, pe_bid, pe_ask, pe_ask_qty = get_bid_ask(row, "PE")
+        
+        # Get change
+        ce_chng = get_change(row, "CE")
+        pe_chng = get_change(row, "PE")
 
         rows.append([
             # ---- CALLS ----
@@ -4508,21 +4696,21 @@ def build_nse_style_full(all_strike_df):
             g(row, "CE_Volume"),
             g(row, "CE_IV"),
             g(row, "CE_LTP"),
-            chng(row, "CE_LTP", "CE_Close"),
-            g(row, "CE_Bid_Qty"),
-            g(row, "CE_Bid"),
-            g(row, "CE_Ask"),
-            g(row, "CE_Ask_Qty"),
+            ce_chng if ce_chng != "" else "",
+            ce_bid_qty,
+            ce_bid,
+            ce_ask,
+            ce_ask_qty,
 
             # ---- STRIKE ----
             g(row, "strike"),
 
             # ---- PUTS ----
-            g(row, "PE_Bid_Qty"),
-            g(row, "PE_Bid"),
-            g(row, "PE_Ask"),
-            g(row, "PE_Ask_Qty"),
-            chng(row, "PE_LTP", "PE_Close"),
+            pe_bid_qty,
+            pe_bid,
+            pe_ask,
+            pe_ask_qty,
+            pe_chng if pe_chng != "" else "",
             g(row, "PE_LTP"),
             g(row, "PE_IV"),
             g(row, "PE_Volume"),
@@ -4531,57 +4719,6 @@ def build_nse_style_full(all_strike_df):
         ])
 
     return rows, date_label
-
-
-def build_nse_style_oi_only(oi_df_all_dates, date_value):
-
-    # ------------------------------------------------------------
-    # PAST DATE -- only OI + Change-in-OI are available from
-    # Historical_OI. Everything else is left blank.
-    # ------------------------------------------------------------
-
-    if oi_df_all_dates is None or oi_df_all_dates.empty:
-        return []
-
-    day = oi_df_all_dates[
-        oi_df_all_dates["trade_date"] == date_value
-    ].copy()
-
-    if day.empty:
-        return []
-
-    day["strike"] = pd.to_numeric(day["strike"], errors="coerce")
-    day = day.dropna(subset=["strike"]).sort_values("strike").reset_index(drop=True)
-
-    def g(row, col):
-        value = row.get(col)
-        if value is None:
-            return ""
-        try:
-            if isinstance(value, float) and np.isnan(value):
-                return ""
-        except Exception:
-            pass
-        return value
-
-    rows = []
-
-    for _, row in day.iterrows():
-
-        rows.append([
-            # ---- CALLS ----
-            g(row, "CE_OI"), g(row, "CE_Change_OI"), "", "", "", "",
-            "", "", "", "",
-
-            # ---- STRIKE ----
-            g(row, "strike"),
-
-            # ---- PUTS ----
-            "", "", "", "", "", "", "", "",
-            g(row, "PE_Change_OI"), g(row, "PE_OI"),
-        ])
-
-    return rows
 
 
 def write_nse_style_sheet(wb, sheet_name, title_text, rows, atm_strike=None):
@@ -4690,11 +4827,181 @@ print("DOWNLOADING ALL-STRIKE OPTION CHAIN")
 print("=" * 80)
 print()
 
-all_strike_chain = build_all_strike_chain(EXPIRY_DATE)
+
+def build_all_strike_chain_from_history(chain_df, expiry_date_str, target_date=None):
+
+    # ------------------------------------------------------------
+    # PAST-EXPIRY FALLBACK OR SPECIFIC DATE SNAPSHOT.
+    #
+    # There is no live snapshot for an expired contract (Upstox's
+    # /option/chain endpoint only covers active/upcoming expiries),
+    # so this reconstructs an all-strike "snapshot" from the
+    # already-downloaded 5-min historical chain instead.
+    #
+    # If target_date is specified, take the LAST candle on that
+    # specific date. Otherwise, take the global last candle.
+    #
+    # Bid/Ask/Bid Qty/Ask Qty/POP/Previous OI have no historical
+    # equivalent (they're live orderbook-only fields), so those
+    # stay blank -- same for CE/PE Instrument Key.
+    # ------------------------------------------------------------
+
+    if chain_df is None or chain_df.empty:
+        return pd.DataFrame()
+
+    df = chain_df.copy()
+
+    if "strike" not in df.columns:
+        return pd.DataFrame()
+
+    df = df.dropna(subset=["strike"])
+
+    if df.empty:
+        return pd.DataFrame()
+
+    # If target_date is specified, filter to that date first
+    if target_date is not None:
+        # Check if trade_date exists, if not create it from timestamp
+        if "trade_date" not in df.columns:
+            if "timestamp" in df.columns:
+                df["trade_date"] = pd.to_datetime(df["timestamp"]).dt.date
+            else:
+                return pd.DataFrame()
+        else:
+            df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
+        
+        df = df[df["trade_date"] == target_date]
+        if df.empty:
+            return pd.DataFrame()
+
+    df = df.sort_values(["strike", "timestamp"])
+
+    # Get the last candle for each strike
+    latest = df.groupby("strike", as_index=False).tail(1).reset_index(drop=True)
+
+    records = []
+
+    for _, row in latest.iterrows():
+
+        strike = row.get("strike")
+        spot_close = row.get("spot_close")
+
+        ce_close = row.get("CE_Close")
+        pe_close = row.get("PE_Close")
+        
+        # Get OHLC data
+        ce_open = row.get("CE_Open")
+        ce_high = row.get("CE_High")
+        ce_low = row.get("CE_Low")
+        pe_open = row.get("PE_Open")
+        pe_high = row.get("PE_High")
+        pe_low = row.get("PE_Low")
+
+        moneyness = ""
+        if np.isfinite(safe_float(strike)) and np.isfinite(safe_float(spot_close)):
+            moneyness = get_moneyness(safe_float(strike), safe_float(spot_close))
+
+        ce_change = row.get("CE_Change_OI")
+        pe_change = row.get("PE_Change_OI")
+        
+        if ce_change is None or np.isnan(ce_change):
+            ce_change = np.nan
+        
+        if pe_change is None or np.isnan(pe_change):
+            pe_change = np.nan
+
+        records.append({
+            "expiry": expiry_date_str,
+            "underlying_spot": spot_close,
+            "strike": strike,
+            "Moneyness": moneyness,
+
+            # CE fields - include OHLC
+            "CE_Instrument_Key": row.get("CE_Instrument_Key", ""),
+            "CE_Open": ce_open,
+            "CE_High": ce_high,
+            "CE_Low": ce_low,
+            "CE_LTP": ce_close,
+            "CE_Close": ce_close,
+            "CE_Volume_RAW": row.get("CE_Volume_RAW"),
+            "CE_Volume": row.get("CE_Volume"),
+            "CE_OI_RAW": row.get("CE_OI_RAW"),
+            "CE_OI": row.get("CE_OI"),
+            "CE_Previous_OI_RAW": np.nan,
+            "CE_Previous_OI": np.nan,
+            "CE_Change_OI": ce_change,
+            # Bid/Ask calculated from OHLC in build_nse_style_full
+            "CE_Bid": np.nan,
+            "CE_Bid_Qty": np.nan,
+            "CE_Ask": np.nan,
+            "CE_Ask_Qty": np.nan,
+            "CE_IV": row.get("CE_IV"),
+            "CE_Delta": row.get("CE_Delta"),
+            "CE_Gamma": row.get("CE_Gamma"),
+            "CE_Theta": row.get("CE_Theta"),
+            "CE_Vega": row.get("CE_Vega"),
+            "CE_POP": np.nan,
+
+            "PCR_OI": row.get("PCR_OI"),
+
+            # PE fields - include OHLC
+            "PE_Instrument_Key": row.get("PE_Instrument_Key", ""),
+            "PE_Open": pe_open,
+            "PE_High": pe_high,
+            "PE_Low": pe_low,
+            "PE_LTP": pe_close,
+            "PE_Close": pe_close,
+            "PE_Volume_RAW": row.get("PE_Volume_RAW"),
+            "PE_Volume": row.get("PE_Volume"),
+            "PE_OI_RAW": row.get("PE_OI_RAW"),
+            "PE_OI": row.get("PE_OI"),
+            "PE_Previous_OI_RAW": np.nan,
+            "PE_Previous_OI": np.nan,
+            "PE_Change_OI": pe_change,
+            "PE_Bid": np.nan,
+            "PE_Bid_Qty": np.nan,
+            "PE_Ask": np.nan,
+            "PE_Ask_Qty": np.nan,
+            "PE_IV": row.get("PE_IV"),
+            "PE_Delta": row.get("PE_Delta"),
+            "PE_Gamma": row.get("PE_Gamma"),
+            "PE_Theta": row.get("PE_Theta"),
+            "PE_Vega": row.get("PE_Vega"),
+            "PE_POP": np.nan,
+        })
+
+    out = pd.DataFrame(records)
+
+    if not out.empty:
+        out = out.sort_values("strike").reset_index(drop=True)
+        out["Total_OI"] = out["CE_OI"].fillna(0) + out["PE_OI"].fillna(0)
+        out["OI_Difference"] = out["PE_OI"] - out["CE_OI"]
+        out["PCR_Change_OI"] = np.where(
+            out["CE_Change_OI"].notna() & (out["CE_Change_OI"].abs() > 0),
+            out["PE_Change_OI"] / out["CE_Change_OI"],
+            np.nan
+        )
+
+    return out
+
+
+if IS_PAST_EXPIRY:
+
+    print("Past expiry: no live snapshot exists, building all-strike chain from historical 5-min data instead.")
+
+    all_strike_chain = build_all_strike_chain_from_history(
+        chain,
+        EXPIRY_DATE
+    )
+
+else:
+
+    all_strike_chain = build_all_strike_chain(EXPIRY_DATE)
 
 all_strike_chain = sync_all_strike_oi_with_historical(
     all_strike_chain,
-    oi_df
+    oi_df,
+    target_date=None  # Use latest for today's sheet
 )
 
 print(
@@ -4708,7 +5015,8 @@ print(
 # ============================================================
 
 nse_style_today_rows, nse_style_today_date = build_nse_style_full(
-    all_strike_chain
+    all_strike_chain,
+    is_historical=False
 )
 
 nse_style_atm_strike = None
@@ -4723,6 +5031,7 @@ if not all_strike_chain.empty and "Moneyness" in all_strike_chain.columns:
         nse_style_atm_strike = float(atm_rows.iloc[0]["strike"])
 
 
+# Build NSE-style sheets for extra dates using historical data
 nse_style_extra_sheets = []
 
 for date_str in EXTRA_OI_DATES:
@@ -4735,20 +5044,44 @@ for date_str in EXTRA_OI_DATES:
         print("Skipping invalid EXTRA_OI_DATES entry:", date_str)
         continue
 
-    extra_rows = build_nse_style_oi_only(
-        oi_df,
-        parsed_date
+    # Build all-strike chain for this specific date from historical data
+    date_all_strike = build_all_strike_chain_from_history(
+        chain,
+        EXPIRY_DATE,
+        target_date=parsed_date
     )
 
-    if extra_rows:
-        nse_style_extra_sheets.append(
-            (date_str, extra_rows)
-        )
+    if date_all_strike is not None and not date_all_strike.empty:
+        print(f"Built all-strike chain for {date_str}, rows: {len(date_all_strike)}")
+        
+        # Sync OI with historical data - PASS THE TARGET DATE
+        try:
+            date_all_strike = sync_all_strike_oi_with_historical(
+                date_all_strike,
+                oi_df,
+                target_date=parsed_date  # Use specific date for OI
+            )
+        except Exception as e:
+            print(f"Warning: OI sync failed for {date_str}: {e}")
+        
+        # Now build NSE-style rows from this date's data - pass is_historical=True
+        try:
+            extra_rows, extra_date_label = build_nse_style_full(
+                date_all_strike, 
+                is_historical=True
+            )
+            
+            if extra_rows:
+                nse_style_extra_sheets.append(
+                    (date_str, extra_rows, extra_date_label)
+                )
+                print(f"NSE-style rows built for {date_str}: {len(extra_rows)}")
+            else:
+                print(f"No NSE-style rows for {date_str}")
+        except Exception as e:
+            print(f"Error building NSE-style rows for {date_str}: {e}")
     else:
-        print(
-            "No Historical_OI data found for EXTRA_OI_DATES entry:",
-            date_str
-        )
+        print(f"No historical data found for {date_str}")
 
 
 print()
@@ -4763,7 +5096,6 @@ print(
     "Expiry list rows:",
     len(expiry_df)
 )
-
 
 
 # ============================================================
@@ -5080,15 +5412,15 @@ try:
 
             print("NSE-style sheet SKIPPED: no all-strike rows to write.")
 
-        for date_str, extra_rows in nse_style_extra_sheets:
+        for date_str, extra_rows, date_label in nse_style_extra_sheets:
 
             write_nse_style_sheet(
                 wb,
                 "OptionChain_NSE_" + date_str,
-                "NIFTY Option Chain (OI only)  |  Expiry: " + str(EXPIRY_DATE)
-                + "  |  Date: " + date_str,
+                "NIFTY Option Chain  |  Expiry: " + str(EXPIRY_DATE)
+                + "  |  As on: " + str(date_label),
                 extra_rows,
-                atm_strike=None
+                atm_strike=None  # No ATM highlighting for past dates
             )
 
             print("NSE-style sheet written: OptionChain_NSE_" + date_str)
@@ -5650,4 +5982,3 @@ print()
 print("=" * 80)
 print("DONE")
 print("=" * 80)
-
