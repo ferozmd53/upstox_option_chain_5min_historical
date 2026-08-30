@@ -148,6 +148,26 @@ STRIKE_STEP = 50
 
 
 # ============================================================
+# NSE-STYLE OPTION CHAIN -- EXTRA DATES
+#
+# The NSE-style sheet for TODAY is always built (full columns:
+# OI, Change OI, Volume, IV, LTP, Change, Bid/Ask).
+#
+# Type any additional past dates here (format "YYYY-MM-DD") to
+# get one extra NSE-style sheet per date, e.g.:
+#
+#   EXTRA_OI_DATES = ["2026-08-28", "2026-08-27"]
+#
+# Past dates only have OI / Change-in-OI history available
+# (Historical_OI), so those sheets show OI + Change-in-OI only;
+# LTP / IV / Volume / Bid / Ask are left blank for past dates
+# since Upstox has no historical replay for those.
+# ============================================================
+
+EXTRA_OI_DATES = []
+
+
+# ============================================================
 # IV
 # ============================================================
 
@@ -4298,6 +4318,261 @@ def sync_all_strike_oi_with_historical(all_strike_df, historical_oi_df):
 
 
 # ============================================================
+# NSE-WEBSITE-STYLE OPTION CHAIN
+#
+# Lays data out exactly like nseindia.com/option-chain:
+#
+# CALLS (left -> right):
+#   OI, CHNG IN OI, VOLUME, IV, LTP, CHNG, BID QTY, BID, ASK, ASK QTY
+#
+# STRIKE (center)
+#
+# PUTS (left -> right):
+#   BID QTY, BID, ASK, ASK QTY, CHNG, LTP, IV, VOLUME, CHNG IN OI, OI
+#
+# Several NSE column names repeat on both sides (OI, BID, etc.),
+# so this is built as a plain header list + row matrix instead
+# of a pandas DataFrame (pandas can't hold duplicate column
+# names cleanly). The Excel-writing step writes these directly
+# with openpyxl.
+# ============================================================
+
+NSE_CHAIN_HEADERS = [
+    "OI", "CHNG IN OI", "VOLUME", "IV", "LTP", "CHNG",
+    "BID QTY", "BID", "ASK", "ASK QTY",
+
+    "STRIKE",
+
+    "BID QTY", "BID", "ASK", "ASK QTY", "CHNG", "LTP", "IV",
+    "VOLUME", "CHNG IN OI", "OI"
+]
+
+
+def build_nse_style_full(all_strike_df):
+
+    # ------------------------------------------------------------
+    # TODAY'S LIVE SNAPSHOT -- all columns populated.
+    # ------------------------------------------------------------
+
+    if all_strike_df is None or all_strike_df.empty:
+        return [], ""
+
+    df = all_strike_df.copy()
+
+    df["strike"] = pd.to_numeric(df["strike"], errors="coerce")
+    df = df.dropna(subset=["strike"]).sort_values("strike").reset_index(drop=True)
+
+    date_label = ""
+    if "Date" in df.columns and not df["Date"].empty:
+        date_label = str(df["Date"].iloc[0])
+
+    def g(row, col):
+        value = row.get(col)
+        if value is None:
+            return ""
+        try:
+            if isinstance(value, float) and np.isnan(value):
+                return ""
+        except Exception:
+            pass
+        return value
+
+    def chng(row, ltp_col, close_col):
+        ltp = row.get(ltp_col)
+        close = row.get(close_col)
+        try:
+            if ltp is None or close is None:
+                return ""
+            if np.isnan(ltp) or np.isnan(close):
+                return ""
+            return ltp - close
+        except Exception:
+            return ""
+
+    rows = []
+
+    for _, row in df.iterrows():
+
+        rows.append([
+            # ---- CALLS ----
+            g(row, "CE_OI"),
+            g(row, "CE_Change_OI"),
+            g(row, "CE_Volume"),
+            g(row, "CE_IV"),
+            g(row, "CE_LTP"),
+            chng(row, "CE_LTP", "CE_Close"),
+            g(row, "CE_Bid_Qty"),
+            g(row, "CE_Bid"),
+            g(row, "CE_Ask"),
+            g(row, "CE_Ask_Qty"),
+
+            # ---- STRIKE ----
+            g(row, "strike"),
+
+            # ---- PUTS ----
+            g(row, "PE_Bid_Qty"),
+            g(row, "PE_Bid"),
+            g(row, "PE_Ask"),
+            g(row, "PE_Ask_Qty"),
+            chng(row, "PE_LTP", "PE_Close"),
+            g(row, "PE_LTP"),
+            g(row, "PE_IV"),
+            g(row, "PE_Volume"),
+            g(row, "PE_Change_OI"),
+            g(row, "PE_OI"),
+        ])
+
+    return rows, date_label
+
+
+def build_nse_style_oi_only(oi_df_all_dates, date_value):
+
+    # ------------------------------------------------------------
+    # PAST DATE -- only OI + Change-in-OI are available from
+    # Historical_OI. Everything else is left blank.
+    # ------------------------------------------------------------
+
+    if oi_df_all_dates is None or oi_df_all_dates.empty:
+        return []
+
+    day = oi_df_all_dates[
+        oi_df_all_dates["trade_date"] == date_value
+    ].copy()
+
+    if day.empty:
+        return []
+
+    day["strike"] = pd.to_numeric(day["strike"], errors="coerce")
+    day = day.dropna(subset=["strike"]).sort_values("strike").reset_index(drop=True)
+
+    def g(row, col):
+        value = row.get(col)
+        if value is None:
+            return ""
+        try:
+            if isinstance(value, float) and np.isnan(value):
+                return ""
+        except Exception:
+            pass
+        return value
+
+    rows = []
+
+    for _, row in day.iterrows():
+
+        rows.append([
+            # ---- CALLS ----
+            g(row, "CE_OI"), g(row, "CE_Change_OI"), "", "", "", "",
+            "", "", "", "",
+
+            # ---- STRIKE ----
+            g(row, "strike"),
+
+            # ---- PUTS ----
+            "", "", "", "", "", "", "", "",
+            g(row, "PE_Change_OI"), g(row, "PE_OI"),
+        ])
+
+    return rows
+
+
+def write_nse_style_sheet(wb, sheet_name, title_text, rows, atm_strike=None):
+
+    from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    if sheet_name in wb.sheetnames:
+        del wb[sheet_name]
+
+    ws = wb.create_sheet(sheet_name)
+
+    header_fill = PatternFill(
+        start_color="312B69", end_color="312B69", fill_type="solid"
+    )
+    band_fill = PatternFill(
+        start_color="312B69", end_color="312B69", fill_type="solid"
+    )
+    strike_fill = PatternFill(
+        start_color="EDEDED", end_color="EDEDED", fill_type="solid"
+    )
+    atm_fill = PatternFill(
+        start_color="FFF2CC", end_color="FFF2CC", fill_type="solid"
+    )
+    white_bold = Font(color="FFFFFF", bold=True)
+    center = Alignment(horizontal="center", vertical="center")
+    thin_border = Border(
+        left=Side(style="thin", color="CCCCCC"),
+        right=Side(style="thin", color="CCCCCC"),
+        top=Side(style="thin", color="CCCCCC"),
+        bottom=Side(style="thin", color="CCCCCC"),
+    )
+
+    # ---- Title row ----
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(NSE_CHAIN_HEADERS))
+    title_cell = ws.cell(row=1, column=1, value=title_text)
+    title_cell.font = Font(bold=True, size=12)
+    title_cell.alignment = Alignment(horizontal="left")
+
+    # ---- CALLS / PUTS band ----
+    band_row = 2
+    ws.merge_cells(start_row=band_row, start_column=1, end_row=band_row, end_column=10)
+    calls_cell = ws.cell(row=band_row, column=1, value="CALLS")
+    calls_cell.font = white_bold
+    calls_cell.alignment = center
+    calls_cell.fill = band_fill
+
+    strike_band_cell = ws.cell(row=band_row, column=11, value="")
+    strike_band_cell.fill = band_fill
+
+    ws.merge_cells(start_row=band_row, start_column=12, end_row=band_row, end_column=21)
+    puts_cell = ws.cell(row=band_row, column=12, value="PUTS")
+    puts_cell.font = white_bold
+    puts_cell.alignment = center
+    puts_cell.fill = band_fill
+
+    # ---- Header row ----
+    header_row = 3
+    for col_idx, header in enumerate(NSE_CHAIN_HEADERS, start=1):
+        cell = ws.cell(row=header_row, column=col_idx, value=header)
+        cell.font = white_bold
+        cell.alignment = center
+        cell.fill = header_fill
+        cell.border = thin_border
+
+    # ---- Data rows ----
+    data_start = header_row + 1
+
+    for r_offset, row_values in enumerate(rows):
+
+        r = data_start + r_offset
+        strike_value = row_values[10]
+
+        is_atm = (
+            atm_strike is not None
+            and strike_value != ""
+            and float(strike_value) == float(atm_strike)
+        )
+
+        for col_idx, value in enumerate(row_values, start=1):
+            cell = ws.cell(row=r, column=col_idx, value=value)
+            cell.border = thin_border
+            cell.alignment = Alignment(horizontal="center")
+
+            if col_idx == 11:
+                cell.fill = atm_fill if is_atm else strike_fill
+                cell.font = Font(bold=True)
+            elif is_atm:
+                cell.fill = atm_fill
+
+    # ---- Column widths ----
+    for col_idx in range(1, len(NSE_CHAIN_HEADERS) + 1):
+        letter = get_column_letter(col_idx)
+        ws.column_dimensions[letter].width = 11 if col_idx != 11 else 12
+
+    ws.freeze_panes = "A4"
+
+
+# ============================================================
 # ALL-STRIKE OPTION CHAIN + SINGLE EXPIRY LIST
 # ============================================================
 
@@ -4318,6 +4593,55 @@ print(
     "All-strike rows:",
     len(all_strike_chain)
 )
+
+
+# ============================================================
+# NSE-STYLE OPTION CHAIN -- BUILD ROWS (used at Excel-write time)
+# ============================================================
+
+nse_style_today_rows, nse_style_today_date = build_nse_style_full(
+    all_strike_chain
+)
+
+nse_style_atm_strike = None
+
+if not all_strike_chain.empty and "Moneyness" in all_strike_chain.columns:
+
+    atm_rows = all_strike_chain[
+        all_strike_chain["Moneyness"] == "ATM"
+    ]
+
+    if not atm_rows.empty:
+        nse_style_atm_strike = float(atm_rows.iloc[0]["strike"])
+
+
+nse_style_extra_sheets = []
+
+for date_str in EXTRA_OI_DATES:
+
+    try:
+        parsed_date = datetime.strptime(
+            date_str, "%Y-%m-%d"
+        ).date()
+    except Exception:
+        print("Skipping invalid EXTRA_OI_DATES entry:", date_str)
+        continue
+
+    extra_rows = build_nse_style_oi_only(
+        oi_df,
+        parsed_date
+    )
+
+    if extra_rows:
+        nse_style_extra_sheets.append(
+            (date_str, extra_rows)
+        )
+    else:
+        print(
+            "No Historical_OI data found for EXTRA_OI_DATES entry:",
+            date_str
+        )
+
 
 print()
 print("=" * 80)
@@ -4616,6 +4940,59 @@ try:
                 32
 
             )
+
+
+    # ========================================================
+    # NSE-WEBSITE-STYLE OPTION CHAIN SHEET(S)
+    #
+    # Isolated in its own try/except: if this fails for any
+    # reason, the rest of the formatting (and the final
+    # wb.save()) still goes ahead, and the real error prints
+    # with a full traceback instead of being swallowed by the
+    # generic "Excel formatting warning" at the bottom.
+    # ========================================================
+
+    try:
+
+        if nse_style_today_rows:
+
+            write_nse_style_sheet(
+                wb,
+                "OptionChain_NSE_Style",
+                "NIFTY Option Chain  |  Expiry: " + str(EXPIRY_DATE)
+                + "  |  As on: " + str(nse_style_today_date),
+                nse_style_today_rows,
+                atm_strike=nse_style_atm_strike
+            )
+
+            print("NSE-style sheet written: OptionChain_NSE_Style")
+            print("Rows written:", len(nse_style_today_rows))
+
+        else:
+
+            print("NSE-style sheet SKIPPED: no all-strike rows to write.")
+
+        for date_str, extra_rows in nse_style_extra_sheets:
+
+            write_nse_style_sheet(
+                wb,
+                "OptionChain_NSE_" + date_str,
+                "NIFTY Option Chain (OI only)  |  Expiry: " + str(EXPIRY_DATE)
+                + "  |  Date: " + date_str,
+                extra_rows,
+                atm_strike=None
+            )
+
+            print("NSE-style sheet written: OptionChain_NSE_" + date_str)
+
+    except Exception as nse_style_error:
+
+        print()
+        print("=" * 80)
+        print("NSE-STYLE SHEET ERROR (formatting continues without it)")
+        print("=" * 80)
+        print(nse_style_error)
+        traceback.print_exc()
 
 
     # ========================================================
@@ -4945,6 +5322,9 @@ try:
         OUTPUT_FILE
     )
 
+    print()
+    print("Workbook saved with sheets:", wb.sheetnames)
+
 
 except Exception as error:
 
@@ -4956,6 +5336,8 @@ except Exception as error:
     print(
         error
     )
+
+    traceback.print_exc()
 
 
 # ============================================================
