@@ -3802,6 +3802,32 @@ chain = chain.sort_values(
 # FINAL COLUMN ORDER
 # ============================================================
 
+# ============================================================
+# BID/ASK PLACEHOLDER COLUMNS
+#
+# Upstox's historical-candle endpoint (which every row of
+# OptionChain_5Min comes from) is OHLCV only -- it has never
+# included bid/ask/bid-qty/ask-qty, for any date, live or past.
+# These start blank here and get backfilled below -- but ONLY for
+# the single most recent 5-min bar of today (if today has any bars
+# at all), from the one live snapshot this run actually captured.
+# Every earlier bar, and every past date, stays genuinely blank --
+# fabricating a constant bid/ask across a whole day of 5-min bars
+# would be dishonest (bid/ask moves throughout the session; only
+# one live moment was ever observed).
+# ============================================================
+
+chain["CE_Bid"] = np.nan
+chain["CE_Bid_Qty"] = np.nan
+chain["CE_Ask"] = np.nan
+chain["CE_Ask_Qty"] = np.nan
+
+chain["PE_Bid"] = np.nan
+chain["PE_Bid_Qty"] = np.nan
+chain["PE_Ask"] = np.nan
+chain["PE_Ask_Qty"] = np.nan
+
+
 final_columns = [
 
     "timestamp",
@@ -3821,6 +3847,11 @@ final_columns = [
     "CE_High",
     "CE_Low",
     "CE_Close",
+
+    "CE_Bid_Qty",
+    "CE_Bid",
+    "CE_Ask",
+    "CE_Ask_Qty",
 
     "CE_Volume_RAW",
     "CE_Volume",
@@ -3860,6 +3891,11 @@ final_columns = [
     "PE_High",
     "PE_Low",
     "PE_Close",
+
+    "PE_Bid_Qty",
+    "PE_Bid",
+    "PE_Ask",
+    "PE_Ask_Qty",
 
     "PE_Volume_RAW",
     "PE_Volume",
@@ -4555,13 +4591,18 @@ NSE_CHAIN_HEADERS = [
 def build_nse_style_full(all_strike_df, is_historical=False):
     """
     Build NSE-style rows from all-strike data.
-    
-    If is_historical=True, use historical 5-min data with proper calculations:
-    - CHNG = current close - current open (change during the candle)
-    - BID = low of the candle
-    - ASK = high of the candle
-    - BID QTY = volume of the candle (approximated)
-    - ASK QTY = volume of the candle (approximated)
+
+    If is_historical=True (a past date, built from 5-min candles):
+    - CHNG   = this date's close vs the PREVIOUS TRADING DAY's
+               close (matches NSE's own "Chng" definition), using
+               CE_Prev_Close/PE_Prev_Close looked up in
+               build_all_strike_chain_from_history().
+    - BID / ASK / BID QTY / ASK QTY are left blank. There is no
+      historical order-book depth available anywhere (not from
+      Upstox, not from NSE's public site or Bhavcopy) for a past
+      date -- only a live snapshot exists -- so these are never
+      approximated from OHLC/Volume, which produced numbers that
+      could never actually match NSE.
     """
     if all_strike_df is None or all_strike_df.empty:
         return [], ""
@@ -4598,83 +4639,73 @@ def build_nse_style_full(all_strike_df, is_historical=False):
             return ""
 
     def get_bid_ask(row, option_type):
-        """Calculate bid/ask from OHLC data for historical candles"""
-        if option_type == "CE":
-            high = safe_value(row.get("CE_High"))
-            low = safe_value(row.get("CE_Low"))
-            close = safe_value(row.get("CE_Close"))
-            volume = safe_value(row.get("CE_Volume"))
-        else:
-            high = safe_value(row.get("PE_High"))
-            low = safe_value(row.get("PE_Low"))
-            close = safe_value(row.get("PE_Close"))
-            volume = safe_value(row.get("PE_Volume"))
-        
-        # For historical data: BID = Low, ASK = High
+        """
+        Bid/Ask/Bid Qty/Ask Qty are live order-book fields.
+        Upstox (and NSE's own public site/Bhavcopy) never exposes
+        historical order-book depth for a past date -- only a live
+        snapshot -- so for historical rows these are genuinely
+        blank rather than approximated from candle High/Low/Volume
+        (that was giving numbers that could never match NSE, since
+        High/Low/Volume aren't bid/ask at all).
+        """
         if is_historical:
-            if np.isfinite(high) and np.isfinite(low):
-                bid = low
-                ask = high
-                # Use volume for bid/ask qty if available
-                if np.isfinite(volume):
-                    bid_qty = volume
-                    ask_qty = volume
-                else:
-                    bid_qty = ""
-                    ask_qty = ""
-                return bid_qty, bid, ask, ask_qty
-        
-        # For live data or fallback: use close with small spread
+            return "", "", "", ""
+
+        if option_type == "CE":
+            bid = safe_value(row.get("CE_Bid"))
+            ask = safe_value(row.get("CE_Ask"))
+            bid_qty = g(row, "CE_Bid_Qty")
+            ask_qty = g(row, "CE_Ask_Qty")
+        else:
+            bid = safe_value(row.get("PE_Bid"))
+            ask = safe_value(row.get("PE_Ask"))
+            bid_qty = g(row, "PE_Bid_Qty")
+            ask_qty = g(row, "PE_Ask_Qty")
+
+        if np.isfinite(bid) and np.isfinite(ask):
+            return bid_qty, bid, ask, ask_qty
+
+        close = safe_value(row.get("CE_Close" if option_type == "CE" else "PE_Close"))
+
         if np.isfinite(close):
-            # Try to use existing bid/ask fields for live data
-            if not is_historical:
-                if option_type == "CE":
-                    bid = safe_value(row.get("CE_Bid"))
-                    ask = safe_value(row.get("CE_Ask"))
-                    bid_qty = g(row, "CE_Bid_Qty")
-                    ask_qty = g(row, "CE_Ask_Qty")
-                else:
-                    bid = safe_value(row.get("PE_Bid"))
-                    ask = safe_value(row.get("PE_Ask"))
-                    bid_qty = g(row, "PE_Bid_Qty")
-                    ask_qty = g(row, "PE_Ask_Qty")
-                
-                # If bid/ask are valid, use them
-                if np.isfinite(bid) and np.isfinite(ask):
-                    return bid_qty, bid, ask, ask_qty
-            
-            # Fallback: use close with spread
             spread = abs(close) * 0.001 if abs(close) > 0 else 0.5
-            bid = close - spread
-            ask = close + spread
-            return "", bid, ask, ""
-        
+            return "", close - spread, close + spread, ""
+
         return "", "", "", ""
 
     def get_change(row, option_type):
-        """Get change for historical data using close - open"""
+        """
+        NSE's "Chng" column is today's price vs the PREVIOUS
+        TRADING DAY's close -- not the same candle's own
+        open-to-close move (that was the bug: it was showing an
+        intraday move, not the day-over-day change NSE shows).
+        """
         if is_historical:
+
             if option_type == "CE":
                 close = safe_value(row.get("CE_Close"))
-                open_price = safe_value(row.get("CE_Open"))
+                prev_close = safe_value(row.get("CE_Prev_Close"))
             else:
                 close = safe_value(row.get("PE_Close"))
-                open_price = safe_value(row.get("PE_Open"))
-            
-            if np.isfinite(close) and np.isfinite(open_price):
-                return close - open_price
-        
-        # For live data, use LTP - Close
+                prev_close = safe_value(row.get("PE_Prev_Close"))
+
+            if np.isfinite(close) and np.isfinite(prev_close):
+                return close - prev_close
+
+            return ""
+
+        # For live data, use LTP - Close (Close = previous day's close
+        # as reported by Upstox's live option-chain endpoint).
         if option_type == "CE":
             ltp = safe_value(row.get("CE_LTP"))
             close = safe_value(row.get("CE_Close"))
         else:
             ltp = safe_value(row.get("PE_LTP"))
             close = safe_value(row.get("PE_Close"))
-        
+
         if np.isfinite(ltp) and np.isfinite(close):
             return ltp - close
-        
+
         return ""
 
     rows = []
@@ -4860,6 +4891,8 @@ def build_all_strike_chain_from_history(chain_df, expiry_date_str, target_date=N
         return pd.DataFrame()
 
     # If target_date is specified, filter to that date first
+    prev_close_lookup = {}
+
     if target_date is not None:
         # Check if trade_date exists, if not create it from timestamp
         if "trade_date" not in df.columns:
@@ -4869,7 +4902,53 @@ def build_all_strike_chain_from_history(chain_df, expiry_date_str, target_date=N
                 return pd.DataFrame()
         else:
             df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
-        
+
+        # ------------------------------------------------------------
+        # PREVIOUS TRADING DAY'S CLOSE (for a correct CHNG later).
+        #
+        # NSE's "Chng" column is today's price vs the PREVIOUS
+        # TRADING DAY's close -- not vs the same candle's own open.
+        # Look that up here, before filtering df down to target_date,
+        # so build_nse_style_full can compute CHNG correctly instead
+        # of the wrong close-minus-open-of-same-candle approximation.
+        # ------------------------------------------------------------
+
+        prev_df = df[df["trade_date"] < target_date]
+
+        if not prev_df.empty:
+
+            prev_df = prev_df.sort_values(["strike", "timestamp"])
+
+            prev_latest = prev_df.groupby(
+                "strike", as_index=False
+            ).tail(1)
+
+            for _, prow in prev_latest.iterrows():
+                prev_close_lookup[prow["strike"]] = (
+                    prow.get("CE_Close"),
+                    prow.get("PE_Close"),
+                )
+
+        # ------------------------------------------------------------
+        # DIAGNOSTICS -- so a CHNG mismatch can be traced to an exact
+        # date/value instead of guessed at. Prints the actual previous
+        # trading day this run resolved to, plus the raw close values
+        # used for the CHNG math, for one reference strike.
+        # ------------------------------------------------------------
+
+        if not prev_df.empty:
+            resolved_prev_date = prev_df["trade_date"].max()
+            print(f"[{target_date}] Previous trading day resolved from history: {resolved_prev_date}")
+        else:
+            print(f"[{target_date}] WARNING: no prior-day candles found in the downloaded "
+                  f"history range -- CHNG will be blank for every strike on this date.")
+
+        for debug_strike in (24200.0, 24150.0, 24250.0):
+            if debug_strike in prev_close_lookup:
+                dbg_ce_prev, dbg_pe_prev = prev_close_lookup[debug_strike]
+                print(f"[{target_date}] Strike {debug_strike}: "
+                      f"CE_Prev_Close={dbg_ce_prev}  PE_Prev_Close={dbg_pe_prev}")
+
         df = df[df["trade_date"] == target_date]
         if df.empty:
             return pd.DataFrame()
@@ -4910,6 +4989,10 @@ def build_all_strike_chain_from_history(chain_df, expiry_date_str, target_date=N
         if pe_change is None or np.isnan(pe_change):
             pe_change = np.nan
 
+        ce_prev_close, pe_prev_close = prev_close_lookup.get(
+            strike, (np.nan, np.nan)
+        )
+
         records.append({
             "expiry": expiry_date_str,
             "underlying_spot": spot_close,
@@ -4923,6 +5006,7 @@ def build_all_strike_chain_from_history(chain_df, expiry_date_str, target_date=N
             "CE_Low": ce_low,
             "CE_LTP": ce_close,
             "CE_Close": ce_close,
+            "CE_Prev_Close": ce_prev_close,
             "CE_Volume_RAW": row.get("CE_Volume_RAW"),
             "CE_Volume": row.get("CE_Volume"),
             "CE_OI_RAW": row.get("CE_OI_RAW"),
@@ -4951,6 +5035,7 @@ def build_all_strike_chain_from_history(chain_df, expiry_date_str, target_date=N
             "PE_Low": pe_low,
             "PE_LTP": pe_close,
             "PE_Close": pe_close,
+            "PE_Prev_Close": pe_prev_close,
             "PE_Volume_RAW": row.get("PE_Volume_RAW"),
             "PE_Volume": row.get("PE_Volume"),
             "PE_OI_RAW": row.get("PE_OI_RAW"),
@@ -4982,6 +5067,15 @@ def build_all_strike_chain_from_history(chain_df, expiry_date_str, target_date=N
             np.nan
         )
 
+        if target_date is not None:
+            for debug_strike in (24200.0, 24150.0, 24250.0):
+                match = out[out["strike"] == debug_strike]
+                if not match.empty:
+                    r = match.iloc[0]
+                    print(f"[{target_date}] Strike {debug_strike}: "
+                          f"CE_Close={r.get('CE_Close')}  CE_Prev_Close={r.get('CE_Prev_Close')}  "
+                          f"-> CHNG={r.get('CE_Close') - r.get('CE_Prev_Close') if pd.notna(r.get('CE_Prev_Close')) else 'N/A'}")
+
     return out
 
 
@@ -5008,6 +5102,88 @@ print(
     "All-strike rows:",
     len(all_strike_chain)
 )
+
+# ------------------------------------------------------------
+# DIAGNOSTIC -- what Upstox's OWN live "close" field (used as the
+# previous-close reference for today's CHNG) looks like, so it can
+# be compared directly against the history-derived CE_Prev_Close
+# used for past dates. If these disagree for the same underlying
+# reference day, the mismatch is in Upstox's own live data, not the
+# history lookup.
+# ------------------------------------------------------------
+if not all_strike_chain.empty:
+    for debug_strike in (24200.0, 24150.0, 24250.0):
+        match = all_strike_chain[all_strike_chain["strike"] == debug_strike]
+        if not match.empty:
+            r = match.iloc[0]
+            print(f"[LIVE] Strike {debug_strike}: CE_LTP={r.get('CE_LTP')}  "
+                  f"CE_Close(Upstox's own previous-close field)={r.get('CE_Close')}  "
+                  f"Date={r.get('Date')}")
+
+
+# ============================================================
+# BACKFILL LIVE BID/ASK INTO OptionChain_5Min
+#
+# Only the single latest 5-min bar of TODAY per strike gets the
+# live Bid/Bid Qty/Ask/Ask Qty from all_strike_chain -- that is
+# the one moment this run actually observed real order-book data.
+# Every earlier bar today, and every past date, has no live source
+# and stays blank (Upstox's historical-candle data never included
+# bid/ask, so there is nothing honest to put there).
+# ============================================================
+
+BIDASK_COLUMNS = [
+    "CE_Bid", "CE_Bid_Qty", "CE_Ask", "CE_Ask_Qty",
+    "PE_Bid", "PE_Bid_Qty", "PE_Ask", "PE_Ask_Qty",
+]
+
+if not all_strike_chain.empty and "trade_date" in chain.columns and "Date" in all_strike_chain.columns:
+
+    try:
+        live_date = pd.to_datetime(all_strike_chain["Date"].iloc[0]).date()
+    except Exception:
+        live_date = None
+
+    if live_date is not None:
+
+        chain["strike"] = pd.to_numeric(chain["strike"], errors="coerce").round(2)
+        all_strike_chain["strike"] = pd.to_numeric(all_strike_chain["strike"], errors="coerce").round(2)
+
+        bidask_lookup = (
+            all_strike_chain
+            .dropna(subset=["strike"])
+            .drop_duplicates(subset=["strike"], keep="last")
+            .set_index("strike")[BIDASK_COLUMNS]
+            .to_dict("index")
+        )
+
+        today_rows = chain[chain["trade_date"] == live_date]
+
+        matched_count = 0
+
+        if not today_rows.empty:
+
+            last_idx_per_strike = today_rows.groupby("strike")["timestamp"].idxmax()
+
+            for strike_val, idx in last_idx_per_strike.items():
+
+                if strike_val in bidask_lookup:
+
+                    for col in BIDASK_COLUMNS:
+                        chain.at[idx, col] = bidask_lookup[strike_val][col]
+
+                    matched_count += 1
+
+        print(
+            f"Backfilled live Bid/Ask into OptionChain_5Min for {matched_count} "
+            f"row(s) on {live_date} (the only bar per strike a live snapshot exists for)."
+        )
+
+    else:
+        print("No live Date found on all_strike_chain -- OptionChain_5Min Bid/Ask left blank.")
+
+else:
+    print("No live all-strike snapshot available -- OptionChain_5Min Bid/Ask left blank.")
 
 
 # ============================================================
@@ -5506,6 +5682,11 @@ try:
         "PE_Low",
         "PE_Close",
 
+        "CE_Bid",
+        "CE_Ask",
+        "PE_Bid",
+        "PE_Ask",
+
         "CE_IV",
         "PE_IV",
 
@@ -5562,6 +5743,11 @@ try:
 
         "spot_volume",
         "spot_oi",
+
+        "CE_Bid_Qty",
+        "CE_Ask_Qty",
+        "PE_Bid_Qty",
+        "PE_Ask_Qty",
 
         "CE_Volume_RAW",
         "CE_Volume",
