@@ -115,7 +115,7 @@ EXPIRY_DATE = "2026-09-01"
 # HISTORICAL RANGE
 # ============================================================
 
-START_DATE = "2026-08-01"
+START_DATE = "2026-08-13"
 
 END_DATE = "2026-09-01"
 
@@ -444,6 +444,61 @@ def get_option_chain(expiry_date):
         return []
 
 
+def get_iv_reference_datetime():
+
+    # ------------------------------------------------------------
+    # WHICH TIMESTAMP THE CURRENT LTP ACTUALLY BELONGS TO.
+    #
+    # Live LTP (CE_LTP/PE_LTP) is only "live" while the market is
+    # open. Outside market hours (evenings, weekends, holidays)
+    # Upstox just keeps returning the LAST TRADED price frozen
+    # from the last session -- but plain datetime.now(IST) keeps
+    # ticking forward. Solving IV with a stale price + a fresh
+    # "now" understates time-to-expiry and skews IV (e.g. showing
+    # 14.4% instead of the correct ~9.5% once the weekend rolls
+    # by). So IV must be solved against the timestamp the price
+    # actually corresponds to, not raw wall-clock time.
+    #
+    # Heuristic (no holiday calendar available here):
+    #   - Weekday, 9:15-15:30 IST -> market is live, use now.
+    #   - Weekday, before 9:15 IST -> still shows previous
+    #     session's close, roll back to the previous weekday
+    #     at 15:30.
+    #   - Weekday, after 15:30 IST -> today's own close, use
+    #     today at 15:30.
+    #   - Saturday / Sunday -> roll back to the most recent
+    #     Friday at 15:30.
+    # ------------------------------------------------------------
+
+    now_ts = datetime.now(IST)
+
+    market_open = now_ts.replace(hour=9, minute=15, second=0, microsecond=0)
+    market_close = now_ts.replace(hour=15, minute=30, second=0, microsecond=0)
+
+    if now_ts.weekday() >= 5:
+        # Saturday (5) or Sunday (6) -> roll back to Friday close.
+        days_back = now_ts.weekday() - 4
+        reference = (now_ts - timedelta(days=days_back)).replace(
+            hour=15, minute=30, second=0, microsecond=0
+        )
+        return reference
+
+    if now_ts < market_open:
+        # Before today's open -> previous weekday's close.
+        days_back = 3 if now_ts.weekday() == 0 else 1
+        reference = (now_ts - timedelta(days=days_back)).replace(
+            hour=15, minute=30, second=0, microsecond=0
+        )
+        return reference
+
+    if now_ts > market_close:
+        # After today's close -> today's own close.
+        return market_close
+
+    # Within market hours -> live.
+    return now_ts
+
+
 def build_all_strike_chain(expiry_date):
 
     raw_rows = get_option_chain(expiry_date)
@@ -531,6 +586,59 @@ def build_all_strike_chain(expiry_date):
 
     if not df.empty:
         df = df.sort_values("strike").reset_index(drop=True)
+
+        # ------------------------------------------------------------
+        # RECOMPUTE CE_IV / PE_IV WITH THE SAME BLACK-SCHOLES SOLVER
+        # USED ON OptionChain_5Min (solve_iv), instead of trusting
+        # Upstox's own "iv" field.
+        #
+        # OptionChain_5Min already solves IV itself and that has been
+        # matching NSE's displayed IV accurately, while Upstox's raw
+        # greeks IV can sit slightly off (e.g. 9.75 vs NSE/solve_iv's
+        # 9.5256 at the same strike). Using the exact same solver
+        # here keeps every sheet consistent with the one that was
+        # already accurate.
+        # ------------------------------------------------------------
+
+        expiry_datetime = datetime.strptime(
+            expiry_date, "%Y-%m-%d"
+        ).replace(hour=15, minute=30, tzinfo=IST)
+
+        now_ts = get_iv_reference_datetime()
+
+        seconds_to_expiry = (
+            expiry_datetime - now_ts
+        ).total_seconds()
+
+        T = max(
+            seconds_to_expiry / (DAYS_PER_YEAR * 24 * 60 * 60),
+            1.0 / DAYS_PER_YEAR
+        )
+
+        recomputed_ce_iv = []
+        recomputed_pe_iv = []
+
+        for _, row in df.iterrows():
+
+            S = row.get("underlying_spot")
+            K = row.get("strike")
+
+            ce_price = row.get("CE_LTP")
+            pe_price = row.get("PE_LTP")
+
+            ce_iv = solve_iv(ce_price, S, K, T, RISK_FREE_RATE, "CE")
+            pe_iv = solve_iv(pe_price, S, K, T, RISK_FREE_RATE, "PE")
+
+            recomputed_ce_iv.append(
+                ce_iv * 100.0 if np.isfinite(ce_iv) else np.nan
+            )
+            recomputed_pe_iv.append(
+                pe_iv * 100.0 if np.isfinite(pe_iv) else np.nan
+            )
+
+        df["CE_IV"] = recomputed_ce_iv
+        df["PE_IV"] = recomputed_pe_iv
+
         df["Total_OI"] = df["CE_OI"].fillna(0) + df["PE_OI"].fillna(0)
         df["OI_Difference"] = df["PE_OI"] - df["CE_OI"]
         df["PCR_Change_OI"] = np.where(
