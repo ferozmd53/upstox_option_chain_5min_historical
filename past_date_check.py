@@ -4169,7 +4169,7 @@ def reorder_all_strike_columns(df):
 # AS OPTIONCHAIN_5MIN
 # ============================================================
 
-def sync_all_strike_oi_with_historical(all_strike_df, historical_oi_df):
+def sync_all_strike_oi_with_historical(all_strike_df, historical_oi_df, target_date=None):
 
     # ------------------------------------------------------------
     # FALLBACK DATE
@@ -4247,8 +4247,8 @@ def sync_all_strike_oi_with_historical(all_strike_df, historical_oi_df):
     # ------------------------------------------------------------
     # IMPORTANT
     #
-    # The latest date is the date shown in OptionChain_AllStrikes.
-    # The previous date is the previous available OI date.
+    # If target_date is specified, use that date for OI.
+    # Otherwise, use the latest date.
     #
     # CHANGE OI IS ALWAYS CALCULATED FROM RAW OI:
     #
@@ -4263,13 +4263,22 @@ def sync_all_strike_oi_with_historical(all_strike_df, historical_oi_df):
         hist["trade_date"].dropna().unique()
     )
 
-    latest_date = all_dates[-1]
-
-    previous_date = (
-        all_dates[-2]
-        if len(all_dates) >= 2
-        else None
-    )
+    # If target_date is specified, use it
+    if target_date is not None:
+        target_date = pd.to_datetime(target_date).date()
+        if target_date in all_dates:
+            latest_date = target_date
+            # Find previous date
+            idx = all_dates.index(latest_date)
+            previous_date = all_dates[idx - 1] if idx > 0 else None
+        else:
+            # If target_date not in historical data, use latest
+            print(f"Warning: target_date {target_date} not found in historical OI. Using latest date instead.")
+            latest_date = all_dates[-1]
+            previous_date = all_dates[-2] if len(all_dates) >= 2 else None
+    else:
+        latest_date = all_dates[-1]
+        previous_date = all_dates[-2] if len(all_dates) >= 2 else None
 
     current = hist[
         hist["trade_date"] == latest_date
@@ -4335,17 +4344,7 @@ def sync_all_strike_oi_with_historical(all_strike_df, historical_oi_df):
         errors="coerce"
     ).round(2)
 
-    # NOTE: both "strike" columns are rounded to 2 decimals above.
-    # Without this, tiny floating-point differences between the
-    # live option-chain strike (e.g. 24200.000000001) and the
-    # historical OI strike (e.g. 24200.0) silently fail the merge
-    # below, leaving CE_OI / PE_OI blank for that strike -- this
-    # was the main cause of OI "not matching" between
-    # OptionChain_AllStrikes and Historical_OI.
-
-    # Remove old OI columns before merging so there is NO _x or _y
-    # collision and no accidental use of old option-chain OI.
-
+    # Remove old OI columns before merging
     old_oi_columns = [
         "CE_OI_RAW",
         "CE_OI",
@@ -4381,11 +4380,6 @@ def sync_all_strike_oi_with_historical(all_strike_df, historical_oi_df):
 
     # ------------------------------------------------------------
     # RAW OI (restored)
-    #
-    # These were previously dropped by old_oi_columns and never
-    # put back, so OptionChain_AllStrikes had no raw OI figures
-    # to compare against Historical_OI. Restoring them here keeps
-    # both sheets showing the exact same raw numbers.
     # ------------------------------------------------------------
 
     result["CE_OI_RAW"] = result["SYNC_CE_OI_RAW"]
@@ -4421,11 +4415,6 @@ def sync_all_strike_oi_with_historical(all_strike_df, historical_oi_df):
 
     # ------------------------------------------------------------
     # CHANGE OI
-    #
-    # DO NOT use 5-minute diff here.
-    # DO NOT copy the option-chain change-OI.
-    #
-    # Calculate directly from the Historical_OI daily values.
     # ------------------------------------------------------------
 
     result["CE_Change_OI"] = (
@@ -4444,10 +4433,6 @@ def sync_all_strike_oi_with_historical(all_strike_df, historical_oi_df):
 
     result["trade_date"] = latest_date
 
-    # Plain, always-visible "Date" column = the OI reference date
-    # (the date whose OI values are shown on this sheet). Same
-    # value as OI_Reference_Date, kept as a separate simple column
-    # so it's easy to spot without hunting through the sheet.
     result["Date"] = latest_date.strftime("%Y-%m-%d")
 
     result["OI_Reference_Date"] = latest_date.strftime(
@@ -4505,9 +4490,6 @@ def sync_all_strike_oi_with_historical(all_strike_df, historical_oi_df):
 
     # ------------------------------------------------------------
     # REORDER COLUMNS
-    #
-    # Put Date / strike / OI / Change OI columns on the left,
-    # instead of at the far right of a very wide sheet.
     # ------------------------------------------------------------
 
     result = reorder_all_strike_columns(result)
@@ -5018,7 +5000,8 @@ else:
 
 all_strike_chain = sync_all_strike_oi_with_historical(
     all_strike_chain,
-    oi_df
+    oi_df,
+    target_date=None  # Use latest for today's sheet
 )
 
 print(
@@ -5071,11 +5054,12 @@ for date_str in EXTRA_OI_DATES:
     if date_all_strike is not None and not date_all_strike.empty:
         print(f"Built all-strike chain for {date_str}, rows: {len(date_all_strike)}")
         
-        # Sync OI with historical data
+        # Sync OI with historical data - PASS THE TARGET DATE
         try:
             date_all_strike = sync_all_strike_oi_with_historical(
                 date_all_strike,
-                oi_df
+                oi_df,
+                target_date=parsed_date  # Use specific date for OI
             )
         except Exception as e:
             print(f"Warning: OI sync failed for {date_str}: {e}")
